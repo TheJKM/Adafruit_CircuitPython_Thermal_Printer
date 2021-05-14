@@ -20,7 +20,9 @@ package for your firmware printer:
 * Author(s): Tony DiCola, Grzegorz Nowicki
 """
 
-
+import math
+import imageio
+import numpy as np
 import adafruit_thermal_printer.thermal_printer as thermal_printer
 
 
@@ -75,3 +77,123 @@ class ThermalPrinter(thermal_printer.ThermalPrinter):
         """
         self._set_timeout(0.5)  # Half second delay for printer to initialize.
         self.reset()
+
+    def print_bitmap(self, file):
+        """ Convert bitmap file and print as picture using GS v 0 command """
+        # pylint: disable=too-many-locals
+        img = imageio.imread(file)
+        # pylint: disable=unused-variable
+        # pylint: disable=unbalanced-tuple-unpacking
+        try:
+            if img.shape[2] == 4:  # 3 colors with alpha channel
+                red, green, blue, alpha = np.split(img, 4, axis=2)
+            # pylint: enable=unused-variable
+            else:  # just 3 colors
+                red, green, blue = np.split(img, 3, axis=2)
+            # pylint: enable=unbalanced-tuple-unpacking
+            red = red.reshape(-1)
+            green = green.reshape(-1)
+            blue = blue.reshape(-1)
+
+            bitmap = list(
+                map(
+                    lambda x: 0.333 * x[0] + 0.333 * x[1] + 0.333 * x[2],
+                    zip(red, green, blue),
+                )
+            )
+            bitmap = np.array(bitmap).reshape([img.shape[0], img.shape[1]])
+            bitmap = np.multiply((bitmap > 208).astype(float), 255)
+
+            data_array = np.array(bitmap.astype(np.uint8))
+
+        except IndexError:  # 2D monochromatic array
+            data_array = np.array(img)
+
+        assert data_array.shape[1] < 385, "bitmap should be less than 385 pixels wide"
+        assert (
+            data_array.shape[0] < 65535
+        ), "bitmap should be less than 65535 pixels high"
+
+        ### Assertion for height is irrelevant. I tested it for over 6000 pixels high
+        ### picture and while it took a long time to send, it printed it without a hitch.
+        ### Theoretical maximum is 65535 pixels but I don't want to waste 7m of paper
+
+        data = self._convert_data_horizontally(data_array)
+
+        ### split into two bytes and prepare to format for printer, x and y sizes of an image
+        img_x = math.ceil(data_array.shape[1] / 8)
+        img_y = data_array.shape[0]
+        img_lx = (img_x & 0xFF).to_bytes(1, byteorder="big")
+        img_hx = ((img_x & 0xFF00) >> 8).to_bytes(1, byteorder="big")
+        img_ly = (img_y & 0xFF).to_bytes(1, byteorder="big")
+        img_hy = ((img_y & 0xFF00) >> 8).to_bytes(1, byteorder="big")
+        mode = b"\x00"
+
+        self._print_horizontal(mode, img_lx, img_hx, img_ly, img_hy, data)
+        # pylint: enable=too-many-locals
+
+    def _print_horizontal(self, mode, img_lx, img_hx, img_ly, img_hy, data):
+        """Send "Print Graphics horizontal module data" command,
+        GS v 0 and append it with provided data,
+        data must conform to printer's required format,
+        use _convert_data_horizontally() to convert data from bitmap to this format
+        """
+        self._uart.write(
+            b"\x1D\x76\x30%s%s%s%s%s%s" % (mode, img_lx, img_hx, img_ly, img_hy, data)
+        )
+        # pylint: disable=invalid-name
+        ### this is pain in the butt
+        for d in data:
+            self._uart.write(d)
+        # pylint: enable=invalid-name
+
+    # pylint: disable=no-self-use
+    def _write_to_byte(self, pos, byte):
+        """Helper method used in _convert_data_horizontally to compress pixel data into bytes"""
+        # pylint: disable=too-many-return-statements
+
+        if pos == 0:
+            return byte | 0b10000000
+        if pos == 1:
+            return byte | 0b01000000
+        if pos == 2:
+            return byte | 0b00100000
+        if pos == 3:
+            return byte | 0b00010000
+        if pos == 4:
+            return byte | 0b00001000
+        if pos == 5:
+            return byte | 0b00000100
+        if pos == 6:
+            return byte | 0b00000010
+        if pos == 7:
+            return byte | 0b00000001
+        return byte | 0b00000000
+        # pylint: enable=too-many-return-statements
+
+    # pylint: enable=no-self-use
+
+    def _convert_data_horizontally(self, data_array):
+        """Convert data from numpy array format to printer's horizontal printing module format"""
+        x_size = data_array.shape[1]
+        y_size = data_array.shape[0]
+
+        datas = bytearray()
+        # pylint: disable=invalid-name
+        # pylint: disable=too-many-nested-blocks
+        for y in range(y_size):
+            for x in range(0, x_size, 8):
+                data = 0
+                for bit in range(8):
+                    try:
+                        if data_array[y][x + bit] == 0:
+                            data = self._write_to_byte(bit, data)
+
+                    except IndexError:
+                        pass
+                    finally:
+                        pass
+                datas.append(data)
+        return datas
+        # pylint: enable=too-many-nested-blocks
+        # pylint: enable=invalid-name
